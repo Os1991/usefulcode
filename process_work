@@ -1,0 +1,436 @@
+import warnings
+#import mmh3
+import numpy as np
+import pandas as pd
+import itertools as it
+import multiprocessing
+
+from sklearn.exceptions import DataConversionWarning
+from sklearn.preprocessing import StandardScaler
+from functools import partial
+
+from ..util import Log
+
+class ParallelProcess:
+    '''
+    Base class for parallel preprocess
+    '''
+    def __init__(self, n_cpu = -1, vls_type = 'list'):
+        self.n_cpu = n_cpu
+        if self.n_cpu == -1:
+            self.n_cpu = multiprocessing.cpu_count()
+        assert vls_type in ('list', 'vls'), 'Not possible vls_type!'
+        self.vls_type = vls_type
+
+    @staticmethod
+    def split_list(l, n):
+        return [l[i:i+n] for i in range(0, len(l), n)]
+
+    def _parallel_func(self, vls, func):
+        pool = multiprocessing.Pool(processes=self.n_cpu)
+        result = pool.map(func, ParallelProcess.split_list(vls, self.n_cpu))
+        pool.close()
+        return list(it.chain.from_iterable(result))
+    
+    def _parallel_func_vls(self, vls, func):
+        pool = multiprocessing.Pool(processes=self.n_cpu)
+        result = pool.map(func, vls)
+        pool.close()
+        return result
+    
+    def process_values(self, vls, func):
+        if self.n_cpu == 1:
+            result = func(vls)
+        else:
+            if self.vls_type == 'list':
+                result = self._parallel_func(vls, func)
+            if self.vls_type == 'vls':
+                result = self._parallel_func_vls(vls, func)
+        return result
+    
+    def process_columns(self, df, cols, func, suffix = '',):
+        for col in cols:
+            col_values = df[col].fillna('').values.tolist()
+            col = col + suffix
+            df[col] = self.process_values(col_values, func)
+            
+            Log.print('preprocess {:s} for {:d} values'.format(col, df[col].shape[0]))
+
+
+def _hash_values(vls, seed):
+    return [mmh3.hash(str(vle), seed) for vle in vls]
+
+
+
+def hash_columns(df, cols, config, name = "hash_columns", n_cpu = -1, suffix = ''):
+    if config.is_train():
+        if name in config: 
+            Log.print('{} already exist in config !'.format(name))
+        config[name] = {"cols": cols, "suffix": suffix}
+    
+    func = partial(_hash_values, seed = config["seed"])
+    ParallelProcess(n_cpu).process_columns(df, config[name]["cols"], func, config[name]["suffix"])
+    
+    
+def _get_params(vls, param):
+    return [getattr(vle, param) for vle in vls]
+
+def _get_param(vle, param):
+    return getattr(vle, param)
+
+
+
+def add_days_diffs(df, cols_diff, config, name = "days_diffs", n_cpu = -1):
+    """ 
+        {col1: [col2, col3]} (part: "days")
+    """
+    if config.is_train():
+        if name in config: 
+            Log.print('{} already exist in config !'.format(name))
+        config[name] = cols_diff
+
+    func = partial(_get_params, param = "days")
+    for col1 in config[name]:
+        for col2 in config[name][col1]:
+            df[col2 + "_to_" + col1 + "_days"] = ParallelProcess(n_cpu).process_values((df[col1]-df[col2]).tolist(), func)
+            #df[col2 + "_to_" + col1 + "_days"] = ParallelProcess(n_cpu, 'vls').process_values(df[col2]-df[col1], func)
+
+
+
+def add_datetime_parts(df, cols_parts, config, name = "date_parts", n_cpu = -1):
+    """Add columns date parts to df:
+    Args:
+        df (pd.DataFrame): DataFrame
+        columns_date_parts: (Dict): dictionary of column ( "year", "weekday", "month", "day", "hour" )
+    """
+    if config.is_train():
+        if name in config: 
+            Log.print('{} already exist in config !'.format(name))
+        config[name] = cols_parts
+    
+    for col in config[name]:
+        for part in config[name][col]:
+            func = partial(_get_params, param = part)
+            df[col + "_" + part] = ParallelProcess(n_cpu).process_values(df[col].tolist(), func)
+
+
+
+def drop_columns(df, columns, config, name = "drop_columns"):
+    if config.is_train():
+        if name in config: 
+            Log.print('{} already exist in config !'.format(name))
+        config[name] = columns
+    df.drop(config[name], axis=1, inplace=True)
+
+
+
+def add_relation(df, relation_cols, config, name = "columns_relation"):
+    """ 
+        {col1: [col2, col3]} (part: "days")
+    """
+    if config.is_train():
+        if name in config: 
+            Log.print('{} already exist in config !'.format(name))
+        config[name] = relation_cols
+
+    for col1 in config[name]:
+        for col2 in config[name][col1]:
+            df[col2 + "_to_" + col1] = df[col2] / df[col1]
+
+
+
+def add_counts(df, groups, config, name = "group_counts"):
+    """ 
+        groups: ([col, col,], [col, col])
+    """
+    if config.is_train():
+        if name in config: 
+            Log.print('{} already exist in config !'.format(name))
+        config[name] = groups
+    
+    for group in config[name]:
+        agg_name='{}_count'.format('_'.join(group))
+        gp = df.groupby(group).size().rename(agg_name)
+        df[agg_name] = df.merge(gp, left_on=group, right_index=True, how='left', copy=False)[agg_name]
+
+
+
+def add_aggregates(df, group, agg_cols, stats, config, name = "group_stats"):
+    """ 
+    Добавляет к изначальной выборке статистики по сгруппированным признакам. 
+    Аналог функции groupby, только действует сразу на все требуемые признаки.
+
+    Аргументы
+    ----------
+    df: pd.DataFrame
+        Выборка
+    group: List
+        Список признков, по которым будет происходить группировка
+    agg_cols: List
+        Список признаков, по которым будут считаться статистики при группировке
+    stats: Dict
+        Набор статистик, которые будут считаться в формате словаря: {'mean': np.mean}
+    config: Config
+        Конфигурация обработки данных
+    name: str
+        Название действия для последующего сохранения требуемой информации в конфигурационный файл
+
+    Пример
+    --------
+    >>> config = process.ProcessConfig("train")
+    >>> df = pd.DataFrame({'REG_NAME': ['10_ПСБ', '198_МКБ', '10_ПСБ', '198_МКБ', '198_МКБ', 
+                                        '10_ПСБ', '10_ПСБ', '198_МКБ', '198_МКБ'], 
+                           'BALLANCE_RUR': [150000, 22000, 75000, 10300, 7500, 230000, 180000, 45000, 50000]})
+    >>> process_utils.add_aggregates(df, ['REG_NAME'], ['BALLANCE_RUR'], {'mean': np.mean}, config, name = "group_stats")
+    >>> df
+        REG_NAME BALLANCE_RUR BALLANCE_RUR_by_REG_NAME_mean
+         10_ПСБ     150000               158750
+         198_МКБ    22000                26960
+         10_ПСБ     75000                158750
+         198_МКБ    10300                26960
+         198_МКБ    7500                 26960
+         10_ПСБ     230000               158750
+         10_ПСБ     180000               158750
+         198_МКБ    45000                26960
+         198_МКБ    50000                26960
+    """
+    if config.is_train():
+        if name in config: 
+            Log.print('{} already exist in config !'.format(name))
+        config[name] = {'group': group, 'agg_cols': agg_cols, 'stats': stats}
+
+    agg_names=['{}_by_{}_{}'.format(vle, '_'.join(config[name]['group']), stat) \
+                             for vle, stat in it.product(config[name]['agg_cols'], config[name]['stats'].keys())]
+    gp = df.groupby(config[name]['group'])[config[name]['agg_cols']].agg(list(config[name]['stats'].values()))
+    gp.columns = agg_names
+    df[agg_names] = df.merge(gp, left_on=config[name]['group'], right_index=True, how='left', copy=False)[agg_names]
+
+
+
+def add_shift_columns(df, group, shift_columns, offset, config, name = "shift_columns"):
+    """ 
+        group: [col1, col2,]
+        shift_columns: List
+        offset: (offset_column: str, offset, 'suffix')
+    """
+    if config.is_train():
+        if name in config: 
+            Log.print('{} already exist in config !'.format(name))
+        config[name] = {'group': group, 'shift_columns': shift_columns, 'offset': offset}
+    
+    group, shift_columns, offset = config[name]['group'], config[name]['shift_columns'], config[name]['offset']
+    
+    merge_columns = group + [offset[0]]
+    offset_names = [col+offset[2] for col in shift_columns]
+    
+    gp = df[merge_columns + shift_columns].copy()
+    gp.columns = merge_columns + offset_names
+    gp[offset[0]] += offset[1]
+    
+    df[offset_names] = df.merge(gp.set_index(merge_columns), left_on=merge_columns, right_index=True, \
+                                    how='left', copy=False, validate='m:1')[offset_names]
+
+
+
+def log1p(df: pd.DataFrame, log_cols, config, name = "log_columns", suffix = ''):
+    if config.is_train():
+        if name in config: 
+            Log.print('{} already exist in config !'.format(name))
+        config[name] = {'log_cols': log_cols, 'suffix': suffix}
+        
+    for col in config[name]['log_cols']:
+        df[col+config[name]['suffix']] = np.log1p(df[col])
+
+
+
+def scale(df, scale_cols, config, name = "scale_columns", suffix = ''):
+    
+    """
+    Применяет функцию (x - mean(x))/std(x) к предиктору.
+    Если abs(std(x)) < 1, тогда std(x) = 1.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+    Данные 
+    
+    scale_cols : list
+    Список из имен колонок для применения к ним преобразования в ходе обучения. 
+    
+    config: ProcessConfig
+    Конфигурация процесса обработки данных
+    
+    name: str, default scale_columns
+    Ключ в config для использования или обучения
+    
+    suffix: str, default ''
+    Добавочный суффикс к имени колонок
+    """
+    warnings.filterwarnings(action = 'ignore', category=DataConversionWarning)
+    if config.is_train():
+        if name in config:
+            Log.print('{} already exist in config !'.format(name))
+            
+        config[name] = {
+                "scaler": {col : StandardScaler(copy = False, with_std = (np.abs(df[col].std()) > 1)) for col in scale_cols}, 
+                "suffix": suffix}
+        for col in scale_cols:
+            config[name]["scaler"][col].fit(df[[col]])
+        
+    for col in config[name]["scaler"].keys():
+        df[col + config[name]['suffix']] = config[name]["scaler"][col].transform(df[[col]])
+
+
+def add_one_hot_encoding(df, columns, config, name = "one_hot_columns", max_values = 10):
+    """ 
+        columns: [col1, col2,] {columns for one hot}
+        max_values: int {max one hot values}
+    """
+    if config.is_train():
+        if name in config: 
+            Log.print('{} already exist in config !'.format(name))
+        config[name] = {}
+        for col in columns:
+            ds_col = df[col].fillna('null')
+            if ds_col.nunique() == 2:
+                config[name][col] = ds_col.value_counts().index[:1].values
+            if 2 < ds_col.nunique():
+                config[name][col] = ds_col.value_counts().index[:max_values].values
+
+    for col in config[name]:
+        ds_col = df[col].fillna('null')
+        for vle in config[name][col]:
+            df['onehot_{}={}'.format(col, vle)] = (ds_col==vle)
+
+
+def add_numerate_cols(df, columns, config, name = "categ_columns", max_values = 100, dtype = "category"):
+    """ 
+    Добавляет кодировку категориальным признакам. Признаки кодируются натуральными числами, от 0 до max_values.
+    Если уникальных значений больше, чем max_values, то кодируются наиболее часто встречаемые категории, 
+    а остальным присваивается значение 0.
+
+    Аргументы
+    ----------
+    df: pd.DataFrame
+        Выборка
+    columns: List
+        Список признков, которые надо закодировать
+    config: Config
+        Конфигурация обработки данных
+    name: str, default "categ_columns"
+        Название действия для последующего сохранения требуемой информации в конфигурационный файл
+    max_values: int, default 100
+        Максимальное количество категорий, после преобразования
+    dtype: str, data type, default "category"
+        Тип данных после кодировки ()
+
+    Пример
+    --------
+    >>> config = process.ProcessConfig("train")
+    >>> df = pd.DataFrame({'REG_NAME': ['10_ПСБ', '198_МКБ', '10_ПСБ', '198_МКБ', '198_МКБ', 
+                                        '10_ПСБ', '10_ПСБ', '198_МКБ', '198_МКБ'], 
+                           'BALLANCE_RUR': [150000, 22000, 75000, 10300, 7500, 230000, 180000, 45000, 50000]})
+    >>> 
+    """
+    if config.is_train():
+        if name in config: 
+            Log.print('{} already exist in config !'.format(name))
+        config[name] = {}
+        config[name]["dtype"] = dtype
+        config[name]["cols"] = {}
+        for col in columns:
+            config[name]["cols"][col] = {j: i+1 for i,j in enumerate(df[col].fillna('null').value_counts().index[:max_values])}
+               
+    for col in config[name]["cols"]:
+        ds = df[col].fillna('null')
+        change_idx = ds.isin(config[name]["cols"][col])
+        df['categ_'+col] = 0
+        df.loc[change_idx, 'categ_'+col] = ds[change_idx].replace(config[name]["cols"][col])
+        df['categ_'+col] = df['categ_'+col].astype(config[name]["dtype"])
+
+
+
+def add_target_encoding(df, target, columns, config):
+    if config.is_train():
+        config["columns_target_encoding"] = {}
+        config["target_mean"] = df[target].mean()
+        
+        fold_array = np.full(shape=df.shape[0], fill_value=-1, dtype=int)
+        for i,fold in enumerate(config["cv"]):
+            fold_array[fold[1]] = i
+        df['fold'] = fold_array
+        
+        def transform_column(c, alpha = 1):
+            df_part_gr = df.groupby([c, 'fold'])[target].agg(['sum', 'count'])
+            df_part_reverse = df_part_gr.groupby(level=c).sum() - df_part_gr
+            df_part_reverse['mean_value'] = (df_part_reverse['sum'] + \
+                                             alpha * config["target_mean"]) / (df_part_reverse['count'] + alpha)
+            return df_part_reverse['mean_value']
+        
+        for c in columns:
+            te_name = 'te_'+c
+            config["columns_target_encoding"][c] = transform_column(c).rename(te_name)
+            df[te_name] = df.merge(config["columns_target_encoding"][c], left_on=[c, 'fold'], right_index=True, \
+                                how='left', validate='m:1')[te_name]
+        df.drop(['fold'], axis=1, inplace=True)
+    else:
+        for c in config["columns_target_encoding"]:
+            te_name = 'te_'+c
+            df[te_name] = df.merge(config["columns_target_encoding"][c].groupby(level=c).mean(), left_on=[c], \
+                                   right_index=True, how='left', validate='m:1')[te_name].fillna(config["target_mean"])
+
+
+
+def to_int8(df, config):
+    if "int8_columns" not in config:
+        config["int8_columns"] = []
+        vals = [-1, 0, 1]
+
+        for c in [c for c in df if c.startswith("number_")]:
+            if (~df[c].isin(vals)).any():
+                continue
+            config["int8_columns"].append(c)
+
+        Log.print("Num columns: {}".format(len(config["int8_columns"])))
+
+    if len(config["int8_columns"]) > 0:
+        df.loc[:, config["int8_columns"]] = df.loc[:, config["int8_columns"]].astype(np.int8)
+        
+
+# Заполняет пропуски в данных
+def fillna(df, columns, config, name = 'fillna', method = 'mean', custom_value = None):
+    if config.is_train():
+        if method == 'mean':
+            config[name] = {col: {'method': 'mean', 'value': df[col].mean()} for col in columns}
+        if method == 'zero':
+            config[name] = {col: {'method': 'zero', 'value': 0} for col in columns}
+        if method == 'negative_mean':
+            config[name] = {col: {'method': 'negative_mean', 'value': -df[col].mean()} for col in columns}
+        if custom_value != None:
+            config[name] = {col: {'method': 'custom_value', 'value': custom_value} for col in columns}
+    for col in config[name]:
+        df[col].fillna(config[name][col]['value'], inplace = True)
+
+# Проводит операцию модуля над данными
+def absolute(df, columns, config, name = 'abs_columns'):
+    if config.is_train():
+        config[name] = columns
+    df[config[name]] = df[config[name]].abs()
+                           
+    
+            
+            
+        
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+
